@@ -1,15 +1,20 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
+from pyspark.sql.functions import col, lit, to_date
+from pyspark.sql.types import StringType, DateType
 from datetime import datetime, timedelta
 from delta.tables import DeltaTable
+import sys
+import os
+import re
+
+# Add config path for imports
+sys.path.append('/Workspace/Users/iamhadiya13@gmail.com/Supply Chain/config')
 from config import (
     TABLE_CONFIG, 
     Raw_volume_path, 
     silver_volume_path, 
     processed_volume_path, LOAD_MODE
 )
-import re
 
 today = datetime.now().strftime('%Y-%m-%d')
 
@@ -51,7 +56,23 @@ def move_to_processed(file_name, raw_path):
     dest_path=f"{processed_volume_path}{file_name}"
 
     try:
-        dbutils.fs.mv(raw_path, dest_path)
+        # Safer 3-step move: copy, verify, delete
+        dbutils.fs.mkdirs(processed_volume_path)
+        dbutils.fs.cp(raw_path, dest_path)
+        
+        # Verify copy was successful
+        try:
+            dbutils.fs.ls(dest_path)
+            copy_ok = True
+        except Exception:
+            copy_ok = False
+        
+        if copy_ok:
+            dbutils.fs.rm(raw_path, recurse=False)
+            print(f"{file_name} moved to {dest_path}")
+        else:
+            raise Exception(f"Copy verification failed for {file_name}")
+        
         return dest_path
     except Exception as e:
         print(f"Error while moving {file_name} from {raw_path} to {dest_path}")
@@ -94,11 +115,13 @@ def get_unprocessed_file():
         print(f"files queued for processing {len(to_process)}")
     
     elif LOAD_MODE=="Full":
-        print("Full load mode is implemented.")
-    
+        print("Full load mode - reading from Raw_volume_path")
+        
+        # Full load should process all files from raw location
         to_process = [
-            f for f in dbutils.fs.ls(processed_volume_path) if f.name.endswith(".csv")
+            f for f in dbutils.fs.ls(Raw_volume_path) if f.name.endswith(".csv")
         ]
+        print(f"Total files queued for full load: {len(to_process)}")
     else:
         raise Exception(f"Invalid LOAD_MODE: {LOAD_MODE}. Must be 'Incremental' or 'Full'.")
     
@@ -129,19 +152,47 @@ def extract_table_name(file_name):
 
 def run_pipeline():
     print("Finding processing files...")
-    files_to_process=get_unprocessed_file()
+    
+    # For full load, prepare temp staging area
+    temp_staging_path = "/Volumes/workspace/default/supplychain/temp_full_load/"
+    
+    if LOAD_MODE=="Full":
+        print("\n=== FULL LOAD MODE ===")
+        print("Step 1: Preparing temp staging area...")
+        
+        # Clear temp staging from any previous failed runs
+        try:
+            dbutils.fs.rm(temp_staging_path, recurse=True)
+            print("  Cleared old temp staging area")
+        except:
+            pass
+        
+        # Create temp staging directory
+        dbutils.fs.mkdirs(temp_staging_path)
+        
+        # Copy all raw files to temp staging
+        raw_files = [f for f in dbutils.fs.ls(Raw_volume_path) if f.name.endswith(".csv")]
+        print(f"Step 2: Copying {len(raw_files)} files to temp staging...")
+        
+        for f in raw_files:
+            dbutils.fs.cp(f.path, f"{temp_staging_path}{f.name}")
+        
+        print(f"  Copied {len(raw_files)} files to {temp_staging_path}")
+        
+        # Now get files from temp staging
+        files_to_process = [f for f in dbutils.fs.ls(temp_staging_path) if f.name.endswith(".csv")]
+        print(f"Step 3: Processing {len(files_to_process)} files from temp staging...")
+    else:
+        # Incremental mode - use normal flow
+        files_to_process = get_unprocessed_file()
 
     if not files_to_process:
         print("No file to process")
         return
-    
-    if LOAD_MODE=="Full":    
-        print("Cleaning silver data for full load...")
-        dbutils.fs.rm(silver_volume_path, recurse=True)
      
     processed_count = skipped_count = failed_count = 0
 
-    print("Processing files...")
+    print("\nProcessing files...")
 
     for file in files_to_process:
         file_name=file.name
@@ -162,14 +213,15 @@ def run_pipeline():
                 Layer="raw",
                 notes="NO ROUTING MATCHED"
                 )
-            print(f"NO ROUTING MATCHED")
+            print(f"NO ROUTING MATCHED for table: {table_name}")
             skipped_count+=1
             continue
         
         try:
             df_raw = spark.read.csv(file_path, header=True, inferSchema=True)
             
-            df_clean=table_config["cleaner"](df_raw, file_name)
+            # FIX: Call cleaner with only df parameter (removed file_name)
+            df_clean=table_config["cleaner"](df_raw)
             
             write_silver(df_clean, table_name, file_name)
             
@@ -182,7 +234,7 @@ def run_pipeline():
                 load_mode=LOAD_MODE,
                 status="SUCCESS",
                 Layer="raw",
-                notes=f" "
+                notes=f"Processed successfully"
             )
 
             processed_count+=1
@@ -198,13 +250,28 @@ def run_pipeline():
                 notes=str(e)[:300]
                 )
             failed_count+=1
-    #summary
-    print(f"\n\nSummary:")
-    print(f"processed: {processed_count}, skipped: {skipped_count}, failed: {failed_count}")
-    print(f"processed: {processed_count+skipped_count+failed_count} total")
+    
+    # Summary
+    print(f"\n\n=== SUMMARY ===")
+    print(f"Processed: {processed_count}, Skipped: {skipped_count}, Failed: {failed_count}")
+    print(f"Total: {processed_count+skipped_count+failed_count}")
 
     if failed_count>0:
+        print(f"\n⚠️  {failed_count} files failed processing")
+        if LOAD_MODE=="Full":
+            print(f"⚠️  Temp staging preserved at: {temp_staging_path}")
+            print(f"   Silver data NOT deleted due to failures")
         raise Exception(f"Failed to process {failed_count} files")
+    
+    # Only if ALL files succeeded in full load mode
+    if LOAD_MODE=="Full" and failed_count==0:
+        print("\nStep 4: All files processed successfully!")
+        print("Step 5: Cleaning temp staging area...")
+        try:
+            dbutils.fs.rm(temp_staging_path, recurse=True)
+            print("  ✓ Temp staging cleaned")
+        except Exception as e:
+            print(f"  Warning: Could not clean temp staging: {e}")
 
 if __name__=="__main__":
     run_pipeline()

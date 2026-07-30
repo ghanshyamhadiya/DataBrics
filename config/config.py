@@ -1,6 +1,8 @@
-from DataIngetion.Raw_to_silver.cleaning import clean_carriers, clean_inventory, clean_shipment, clean_supplier, clean_warehouse, clean_orders
+import sys
+sys.path.append('/Workspace/Users/iamhadiya13@gmail.com/Supply Chain/Ingestion/Raw_to_silver')
+from cleaning import clean_carriers, clean_inventory, clean_shipment, clean_supplier, clean_warehouse, clean_orders
 
-LOAD_MODE='Incremental'
+LOAD_MODE='Full'
 
 Raw_volume_path="/Volumes/workspace/default/supplychain/Raw_data/"
 
@@ -50,6 +52,15 @@ TABLE_CONFIG = {
     },
 
     "warehouse": {
+        "cleaner": clean_warehouse,
+        "gold_transform": "transform_warehouse",
+        "key": "warehouse_id",
+        "partition": "file_date",
+        "load_type": "merge"
+    },
+    
+    # Aliases for plural variations
+    "warehouses": {
         "cleaner": clean_warehouse,
         "gold_transform": "transform_warehouse",
         "key": "warehouse_id",

@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, when, trim, regexp_replace, round, greatest
+from pyspark.sql.functions import col, lit, when, trim, regexp_replace, round, greatest, to_timestamp
 from pyspark.sql.types import StringType, DoubleType, DateType, IntegerType, BooleanType
 from datetime import datetime, timedelta
 
@@ -10,7 +10,6 @@ today_str = datetime.now().strftime('%Y%m%d')
 mobile_regex=r"[^0-9+]"
 
 payment_due=r"[^\d]"
-
 
 def base_cleaning(df):
     return (
@@ -30,7 +29,11 @@ def clean_carriers(df):
 
     cleaned = (
         base_cleaning(df)\
-        .withColumn("is_active", when(col("is_active")==1, True).otherwise(False))\
+        .withColumn("on_time_rate_pct", regexp_replace(col("on_time_rate_pct"), r"[^\d\.]", "").cast(DoubleType()))\
+        .withColumn("damage_rate_pct", regexp_replace(col("damage_rate_pct"), r"[^\d\.]", "").cast(DoubleType()))\
+        .withColumn("cost_per_km", regexp_replace(col("cost_per_km"), r"[^\d\.]", "").cast(DoubleType()))\
+        .withColumn("max_weight_kg", col("max_weight_kg").cast(DoubleType()))\
+        .withColumn("is_active", when(col("is_active").cast(IntegerType())==1, True).otherwise(False))\
     )
     return cleaned
 
@@ -39,7 +42,8 @@ def clean_warehouse(df):
     cleaned=(
         base_cleaning(df)\
         .withColumn("phone", regexp_replace("phone", mobile_regex, ""))\
-        .withColumn("is_active", when(col("is_active")==1, True).otherwise(False))\
+        .withColumn("is_active", when(col("is_active").cast(IntegerType())==1, True).otherwise(False))\
+        .withColumn("created_at", to_timestamp(col("created_at"), "MM/dd/yyyy HH:mm:ss"))
     )
     return cleaned
 
@@ -50,6 +54,8 @@ def clean_supplier(df):
         base_cleaning(df)\
         .withColumn("payment_due", regexp_replace("payment_terms", payment_due, "").cast("int"))\
         .withColumn("phone", regexp_replace("phone", mobile_regex, ""))\
+        .withColumn("is_active", when(col("is_active").cast(IntegerType())==1, True).otherwise(False))\
+        .withColumn("created_at", to_timestamp(col("created_at"), "MM/dd/yyyy HH:mm:ss"))
     )
     return cleaned
 
@@ -70,6 +76,8 @@ def clean_inventory(df):
                     )\
         .withColumn("is_below_reorder", when(col("final_quantity_available")<=col("reorder_point"), lit(True))
                     .otherwise(lit(False)))\
+        .withColumn("created_at", to_timestamp(col("created_at"), "MM/dd/yyyy HH:mm:ss"))
+
     )
     return cleaned
 
@@ -77,6 +85,10 @@ def clean_inventory(df):
 def clean_shipment(df):
     cleaned=(
         base_cleaning(df)\
+        .drop("product_id", "status")  # Drop columns not needed in silver
+        .withColumn("shipment_date", to_timestamp(col("shipment_date"), "yyyy-MM-dd"))
+        .withColumn("expected_delivery", to_timestamp(col("expected_delivery"), "yyyy-MM-dd"))
+        .withColumn("actual_delivery", to_timestamp(col("actual_delivery"), "yyyy-MM-dd"))
         .withColumn("is_delayed", when(col("expected_delivery")==col("actual_delivery"), 'N')
             .when(col("actual_delivery")>col("expected_delivery"), 'Y')
             .when(col("actual_delivery")<col("expected_delivery"), 'N').otherwise('Unknown'))
@@ -94,14 +106,43 @@ def clean_shipment(df):
         .cast("double"))\
         .withColumn("lost_in_transit", when(col("quantity_delivered").isNull(), None)
         .otherwise(greatest(lit(0), col("quantity_shipped")-col("quantity_delivered"))))
+        .withColumn("created_at", to_timestamp(col("created_at"), "yyyy-MM-dd HH:mm:ss"))
     )
     
     return cleaned
 
+def clean_customers(df):
+
+    cleaned=(
+        base_cleaning(df)\
+        .withColumn("credit_term", regexp_replace("credit_term", payment_due, "").cast("int"))
+        .withColumn("credit_limit", regexp_replace(col("credit_limit"), r"[^\d\.]", ""))
+        .withColumn("credit_limit", when(col("credit_limit").isNotNull(), col("credit_limit").cast(DoubleType()))
+        .otherwise(None))
+        .withColumn("is_active", when(col("is_active").cast(IntegerType())==1, True).otherwise(False))
+        .withColumn("created_at", to_timestamp(col("created_at"), "MM/dd/yyyy HH:mm:ss"))
+
+    )
+    return cleaned
+
+def clean_products(df):
+
+    cleaned=(
+        base_cleaning(df)\
+        .withColumn("is_fragile", when(col("is_fragile").cast(IntegerType())==1, True).otherwise(False))\
+        .withColumn("is_temperature_controlled", when(col("is_temperature_controlled").cast(IntegerType())==1, True).otherwise(False))\
+        .withColumn("is_active", when(col("is_active").cast(IntegerType())==1, True).otherwise(False))
+        .withColumn("created_at", to_timestamp(col("created_at"), "MM/dd/yyyy HH:mm:ss"))
+    )
+    return cleaned
 
 def clean_orders(df):
 
     cleaned=(
         base_cleaning(df)
+        .drop("product_id", "sales_channel", "discount_pct")  # Drop columns not needed in silver
+        .withColumn("order_date", to_timestamp(col("order_date"), "yyyy-MM-dd"))
+        .withColumn("required_delivery", to_timestamp(col("required_delivery"), "yyyy-MM-dd"))
+        .withColumn("created_at", to_timestamp(col("created_at"), "yyyy-MM-dd HH:mm:ss"))
     )
     return cleaned
